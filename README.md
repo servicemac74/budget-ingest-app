@@ -127,20 +127,19 @@ full roadmap this fits into.
   `budget/bills/...`). Not the same app as this one, despite living in the
   same Firebase project.
 
-## One-time setup still needed (not done yet)
+## Published, live
 
-This repo exists locally with a first commit, but is **not yet published
-to GitHub or live anywhere.** Per `APP TEMPLATES/family-web-app/TEMPLATE_PROCESS.md`
-§1.B-C:
+Public repo: `github.com/servicemac74/budget-ingest-app`. Live at
+`https://servicemac74.github.io/budget-ingest-app/`. Published 2026-11-16
+via the GitHub CLI (`gh repo create --public --source=. --push`, then
+`gh api .../pages` to enable Pages) - `gh` is installed and authenticated
+on this machine, so a future app in this family no longer needs the
+GitHub Desktop GUI steps `TEMPLATE_PROCESS.md` describes; `gh repo create`
+covers repo creation + first push in one step, `gh api` covers Pages.
 
-1. GitHub Desktop → File → Add Local Repository → point at this folder.
-2. **Publish repository** → name it (e.g. `budget-ingest-app`) → **uncheck
-   "Keep this code private"** (GitHub Pages needs a public repo on the free
-   plan) → Publish.
-3. On github.com, open the repo → Settings → Pages → Source: Deploy from a
-   branch → Branch: `main`, Folder: `/ (root)` → Save. Live in 1-2 minutes
-   at `https://servicemac74.github.io/budget-ingest-app/`.
-
-These three steps need a human at the GitHub Desktop GUI (no `gh` CLI is
-installed on this machine) - a Claude Code session can prep everything up
-to this point and pick back up once it's published.
+Verified live in a real browser (not just a local file): page loads with
+0 console errors, Firebase connects and the sync badge shows "synced."
+The actual upload-a-CSV flow hasn't been verified through browser
+automation (file pickers can't be driven that way) - the categorization
+logic itself was validated separately, directly against real data, before
+this was ever committed.
