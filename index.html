@@ -84,8 +84,25 @@ select, .freetext{font-size:14px; padding:6px 8px; border-radius:6px; border:1px
 // scripts (dedupAndCategorize() in handoff_v26_build_writeplan.js and its
 // predecessors), which already do this correctly against the live T1 table.
 // This app only flags/removes exact duplicate ROWS within one upload.
+//
+// VERSION HISTORY
+// v1 (2026-11-16): one combined-CSV upload per pull (Chris's bank export
+//   bundled all 7 accounts into one file with an account column).
+// v2 (2026-11-16, same day): Chris's banks switched to raw, per-institution
+//   portal exports (one file per account - BoA/Delta/Ameris, each its own
+//   CSV shape) - see _budget_ingest_analysis/AUTOMATION_ROADMAP.md "Raw
+//   multi-bank-portal ingestion". Replaced the single bankFile upload with
+//   a repeatable per-account "Add a bank file" flow (mergeAccountData(),
+//   replace-by-account so re-adding a account never double-counts).
+//   STATE.pull gained `filesAdded` (what's been added this pull, for
+//   display) and each `balances` entry gained `source` ('file' |
+//   'manual-confirmed' | 'carry-forward') - ported straight from the
+//   Node-side parse_raw_bank_exports.js's `balanceNeedsConfirmation`
+//   contract (a BoA file with pending transactions, or any Ameris file
+//   which never has a balance column, requires Chris to type the real
+//   balance instead of auto-trusting the file).
 // ============================================================================
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 var STATE = { pull: null };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
@@ -121,28 +138,101 @@ var WK_BOUNDS = [
   ['Wk4', toSerial('11/23/26'), toSerial('11/30/26')],
 ];
 function weekOf(serial){ for (var i=0;i<WK_BOUNDS.length;i++){ if(serial>=WK_BOUNDS[i][1] && serial<=WK_BOUNDS[i][2]) return WK_BOUNDS[i][0]; } return 'Wk5'; }
-
-function parseBankCSV(text){
-  var rawRows = parseCSVRows(text);
-  var balances = [];
-  var hdr = -1;
-  for (var i=0;i<rawRows.length;i++){
-    var r0 = String(rawRows[i][0]||'').trim();
-    if (r0==='Date' && String(rawRows[i][1]||'').trim()==='Description'){ hdr=i; break; }
-    var bal = parseFloat(rawRows[i][1]);
-    if (r0 && !isNaN(bal)) balances.push({account:r0, balance:bal});
-  }
-  var txns = [];
-  for (var r=hdr+1; r<rawRows.length; r++){
-    var row = rawRows[r];
-    var date=row[0], desc=row[1], amount=row[2], account=row[3];
-    if (!date || !desc) continue;
-    var amt = parseFloat(String(amount).replace(/,/g,''));
-    if (isNaN(amt) || amt===0) continue;
-    txns.push({ id: uid('t'), dateStr: date, serial: toSerial(date), description: desc, amount: Math.abs(amt), isDebit: amt<0, account: account });
-  }
-  return { balances: balances, transactions: txns };
+function isValidDateStr(s){ return toSerial(s)!==null; }
+function parseMoney(s){
+  if (s===undefined||s===null||s==='') return NaN;
+  var cleaned = String(s).replace(/[$,()]/g,'').replace(/^\s+|\s+$/g,'');
+  var negParen = /\(/.test(String(s));
+  var n = parseFloat(cleaned);
+  if (isNaN(n)) return NaN;
+  return negParen ? -Math.abs(n) : n;
 }
+
+// ---------------- raw bank-portal parsers (ported 2026-11-16 from the
+// Claude-side parse_raw_bank_exports.js, validated there against all six of
+// Chris's real files before this port - see AUTOMATION_ROADMAP.md "Raw
+// multi-bank-portal ingestion"). One file per account now, not one combined
+// CSV - this replaces the old parseBankCSV() entirely; the old combined
+// "stmt (N).csv" format is no longer produced by Chris's bank portals. ----
+function parseBoAFile(text, account){
+  var rows = parseCSVRows(text);
+  var balance = null;
+  for (var i=0;i<rows.length;i++){ if (/^Ending balance as of/i.test(String(rows[i][0]||''))){ balance = parseFloat(String(rows[i][2]).replace(/,/g,'')); break; } }
+  var hdr=-1; for (var h=0;h<rows.length;h++){ if (rows[h][0]==='Date' && rows[h][1]==='Description'){ hdr=h; break; } }
+  var transactions=[], pendingSkipped=[];
+  for (var r=hdr+1; r<rows.length; r++){
+    var row=rows[r]; var dateField=String(row[0]||'').trim();
+    if (!dateField) continue;
+    if (!isValidDateStr(dateField)){
+      if (dateField==='Processing' || dateField==='Authorized') pendingSkipped.push({description:row[1], amount:row[3]});
+      continue;
+    }
+    var desc=row[1];
+    if (/^Beginning balance as of/i.test(String(desc||''))) continue;
+    var amt = parseFloat(String(row[2]).replace(/,/g,''));
+    if (isNaN(amt) || amt===0) continue;
+    transactions.push({ id: uid('t'), dateStr: dateField, serial: toSerial(dateField), description: desc, amount: Math.abs(amt), isDebit: amt<0, account: account });
+  }
+  if (balance===null) throw new Error('No "Ending balance as of" line found in this BoA file.');
+  // balanceNeedsConfirmation: BoA's "Ending balance" line does not net out
+  // pending holds the same way BoA's own app balance does (confirmed
+  // 2026-11-16: a file said $3,267.82 while Chris's actual confirmed
+  // balance that same pull was $1,867.56) - never auto-apply `balance` when
+  // this is true, ask Chris for the real figure instead.
+  return { transactions: transactions, balance: balance, pendingSkipped: pendingSkipped, balanceNeedsConfirmation: pendingSkipped.length>0 };
+}
+function parseDeltaFile(text, account){
+  var rows = parseCSVRows(text);
+  var hdr=-1; for (var h=0;h<rows.length;h++){ if (rows[h][0]==='Transaction Number' && rows[h][1]==='Date'){ hdr=h; break; } }
+  if (hdr===-1) throw new Error('Delta header row ("Transaction Number,Date,...") not found in this file.');
+  var transactions=[], balance=null, balanceSerial=-1;
+  for (var r=hdr+1; r<rows.length; r++){
+    var row=rows[r]; var dateField=String(row[1]||'').trim();
+    if (!dateField || !isValidDateStr(dateField)) continue;
+    var desc = row[3] || row[2]; // Memo (real detail) preferred over the generic Description column
+    var debit = parseFloat(String(row[4]).replace(/,/g,''));
+    var credit = parseFloat(String(row[5]).replace(/,/g,''));
+    var amt = !isNaN(debit) ? -Math.abs(debit) : (!isNaN(credit) ? Math.abs(credit) : NaN);
+    var bal = parseFloat(String(row[6]).replace(/,/g,''));
+    var serial = toSerial(dateField);
+    if (!isNaN(bal) && serial!==null && serial>balanceSerial){ balance=bal; balanceSerial=serial; }
+    if (isNaN(amt) || amt===0) continue;
+    transactions.push({ id: uid('t'), dateStr: dateField, serial: serial, description: desc, amount: Math.abs(amt), isDebit: amt<0, account: account });
+  }
+  if (balance===null) throw new Error('No balance column found in this Delta file.');
+  return { transactions: transactions, balance: balance };
+}
+function parseAmerisFile(text, account){
+  var rows = parseCSVRows(text);
+  var hdr=-1; for (var h=0;h<rows.length;h++){ if (rows[h][0]==='Date' && rows[h][2]==='Transaction Type'){ hdr=h; break; } }
+  if (hdr===-1) throw new Error('Ameris header row ("Date,Check#,Transaction Type,...") not found in this file.');
+  var transactions=[];
+  for (var r=hdr+1; r<rows.length; r++){
+    var row=rows[r]; var dateField=String(row[0]||'').trim();
+    if (!dateField || !isValidDateStr(dateField)) continue;
+    var desc=row[3];
+    var debit=parseMoney(row[4]), credit=parseMoney(row[5]);
+    var amt = (!isNaN(debit) && debit!==0) ? -Math.abs(debit) : ((!isNaN(credit) && credit!==0) ? Math.abs(credit) : NaN);
+    if (isNaN(amt)) continue;
+    transactions.push({ id: uid('t'), dateStr: dateField, serial: toSerial(dateField), description: desc, amount: Math.abs(amt), isDebit: amt<0, account: account });
+  }
+  // Ameris exports never carry a balance column at all. The Node-side
+  // convention (a Claude session prepends "BALANCE,<amount>" read off a
+  // screenshot) exists to support headless re-runs with no live UI - this
+  // app always has a live UI, so Chris just types the balance directly
+  // (see the manual-balance input wired in wireAddFile()) instead.
+  return { transactions: transactions, balance: null };
+}
+var ACCOUNTS = [
+  { value:'boa joint',          label:'BoA Joint',                type:'boa' },
+  { value:'boa hamly',          label:'BoA Hamly',                 type:'boa' },
+  { value:'delta pay from',     label:'Delta Pay From (Checking)', type:'delta' },
+  { value:'delta savings',      label:'Delta Savings',             type:'delta' },
+  { value:'delta money market', label:'Delta Money Market',        type:'delta' },
+  { value:'ameris macs tax',    label:'Ameris Macs Tax',           type:'ameris' },
+  { value:'ameris macs rox',    label:'Ameris Macs Rox',           type:'ameris' },
+];
+function accountInfo(value){ return ACCOUNTS.find(function(a){ return a.value===value; }); }
 
 // ---------------- categorization (ported from normalize_lib.js + dedupAndCategorize()) ----------------
 var AMBIGUOUS_STOREFRONTS = ['WM SUPERCENTER','WAL-MART','WALMART','SAMS CLUB',"SAM'S CLUB",'TARGET','COSTCO'];
@@ -201,26 +291,40 @@ function parseReferenceCSV(text){
 // ---------------- app state / render ----------------
 var REF = { refByKey: new Map(), subs: [] };
 
-function newPull(bankParsed){
-  var txns = bankParsed.transactions.map(function(t){
+function ensurePull(){
+  if (!STATE.pull) STATE.pull = { pullDate: new Date().toISOString().slice(0,10), status:'staging', transactions: [], balances: [] };
+  return STATE.pull;
+}
+// Merges one account's freshly-parsed file (or manually-entered balance) into
+// the current pull. Replace-by-account, not append-only: re-adding an
+// account (Chris picked the wrong file, or wants to redo one) drops that
+// account's previously-added transactions first, so nothing doubles up.
+// Cross-pull dedup against the live Excel T1 table still stays with the
+// Claude-side reconcile scripts (see the SCOPE NOTE above) - this is only
+// about not duplicating rows within this app's own current pull.
+function mergeAccountData(account, rawTxns, balanceEntry){
+  var p = ensurePull();
+  p.transactions = p.transactions.filter(function(t){ return t.account !== account; });
+  var cat_txns = rawTxns.map(function(t){
     var cat = categorize(t.description, t.serial, REF.refByKey);
     return Object.assign({}, t, cat, { resolved: cat.confidence === 'high', flaggedForClaude:false, claudeNote:'' });
   });
-  STATE.pull = { pullDate: new Date().toISOString().slice(0,10), status:'staging', transactions: txns, balances: bankParsed.balances };
+  p.transactions = p.transactions.concat(cat_txns);
+  p.balances = p.balances.filter(function(b){ return b.account !== account; });
+  if (balanceEntry) p.balances.push(balanceEntry);
+  p.filesAdded = p.filesAdded || [];
+  p.filesAdded = p.filesAdded.filter(function(f){ return f.account !== account; });
+  p.filesAdded.push({ account: account, txnCount: cat_txns.length, balance: balanceEntry ? balanceEntry.balance : null, source: balanceEntry ? balanceEntry.source : 'none', addedAt: new Date().toISOString() });
   saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
 }
 
 function render(){
   var main = document.getElementById('main');
   var footer = document.getElementById('footerBar');
-  if (!STATE.pull){
-    main.innerHTML =
-      '<div class="card"><h2>Start a new pull</h2>' +
-      '<div class="file-row"><label>Bank export CSV (required)</label><input type="file" id="fileBank" accept=".csv"></div>' +
-      '<div class="file-row"><label>Reference file - archive_reference_full.csv (optional - skip and everything lands in "needs your review")</label><input type="file" id="fileRef" accept=".csv"></div>' +
-      '<button class="primary" id="btnStart" disabled>Parse &amp; categorize</button>' +
-      '</div>';
-    wireUpload();
+  var html = renderAddFileCard();
+  if (!STATE.pull || !STATE.pull.transactions.length && !STATE.pull.balances.length){
+    main.innerHTML = html;
+    wireAddFile();
     footer.style.display = 'none';
     return;
   }
@@ -228,9 +332,9 @@ function render(){
   var needsReview = p.transactions.filter(function(t){ return !t.resolved && !t.flaggedForClaude; });
   var needsClaude = p.transactions.filter(function(t){ return t.flaggedForClaude; });
   var ok = p.transactions.filter(function(t){ return t.resolved && !t.flaggedForClaude; });
-  var html = '';
+
   html += '<div class="card"><h2>Account balances as of ' + esc(p.pullDate) + '</h2>';
-  html += p.balances.length ? p.balances.map(function(b){ return '<div class="bal-row"><span>'+esc(b.account)+'</span><span>$'+b.balance.toFixed(2)+'</span></div>'; }).join('') : '<div class="empty">No balance header found in this CSV.</div>';
+  html += p.balances.length ? p.balances.map(function(b){ return '<div class="bal-row"><span>'+esc(b.account)+(b.source==='manual-confirmed'?' <span class="pill">you confirmed</span>':b.source==='carry-forward'?' <span class="pill">carried forward</span>':'')+'</span><span>$'+b.balance.toFixed(2)+'</span></div>'; }).join('') : '<div class="empty">No accounts added yet.</div>';
   html += '</div>';
 
   html += '<div class="card"><h2>Needs your review <span class="section-count">(' + needsReview.length + ')</span></h2>';
@@ -248,7 +352,29 @@ function render(){
   main.innerHTML = html;
   footer.style.display = 'flex';
   document.getElementById('btnReady').disabled = (needsReview.length > 0);
+  wireAddFile();
   wireReview();
+}
+function renderAddFileCard(){
+  var p = STATE.pull;
+  var added = (p && p.filesAdded) ? p.filesAdded : [];
+  var acctOpts = ACCOUNTS.map(function(a){ return '<option value="'+a.value+'">'+esc(a.label)+'</option>'; }).join('');
+  var html = '<div class="card"><h2>Add a bank file</h2>';
+  html += '<div class="file-row"><label>Reference file - archive_reference_full.csv (optional, upload once - skip and everything lands in "needs your review")</label><input type="file" id="fileRef" accept=".csv"></div>';
+  html += '<div class="file-row"><label>Account</label><select id="addAccount"><option value="">- choose account -</option>' + acctOpts + '</select></div>';
+  html += '<div class="file-row" id="addNoFileRow" style="display:none;"><label><input type="checkbox" id="addNoFile"> No new file this round for this account - just set/confirm its balance</label></div>';
+  html += '<div class="file-row" id="addFileRow" style="display:none;"><label id="addFileLabel">Raw export file (.csv)</label><input type="file" id="addFile" accept=".csv,.CSV"></div>';
+  html += '<div class="file-row" id="addBalanceRow" style="display:none;"><label id="addBalanceLabel">Current balance</label><input type="number" step="0.01" class="freetext" id="addBalanceInput" placeholder="e.g. 156.36"></div>';
+  html += '<div id="addFileError" style="display:none; color:#9B2020; font-size:13px; margin-bottom:8px;"></div>';
+  html += '<button class="primary" id="btnAddFile" disabled>Add this account</button>';
+  if (added.length){
+    html += '<div style="margin-top:12px;">' + added.map(function(f){
+      var info = accountInfo(f.account);
+      return '<div class="bal-row"><span>' + esc(info?info.label:f.account) + ' &middot; ' + f.txnCount + ' txns</span><span>' + (f.balance!=null ? '$'+f.balance.toFixed(2) : '-') + '</span></div>';
+    }).join('') + '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 function money(t){ return (t.isDebit?'-':'+') + '$' + t.amount.toFixed(2); }
 function renderReviewTxn(t){
@@ -312,19 +438,105 @@ function wireReview(){
     });
   });
 }
-function wireUpload(){
-  var bankFile=null, refFile=null;
-  document.getElementById('fileBank').addEventListener('change', function(e){ bankFile = e.target.files[0]; check(); });
-  document.getElementById('fileRef').addEventListener('change', function(e){ refFile = e.target.files[0]; check(); });
-  function check(){ document.getElementById('btnStart').disabled = !bankFile; }
-  document.getElementById('btnStart').addEventListener('click', function(){
-    var readBank = new Promise(function(res){ var r=new FileReader(); r.onload=function(){res(r.result);}; r.readAsText(bankFile); });
-    var readRef = refFile ? new Promise(function(res){ var r=new FileReader(); r.onload=function(){res(r.result);}; r.readAsText(refFile); }) : Promise.resolve(null);
-    Promise.all([readBank, readRef]).then(function(results){
-      if (results[1]) REF = parseReferenceCSV(results[1]);
-      newPull(parseBankCSV(results[0]));
-    });
+function wireAddFile(){
+  var fileRefInput = document.getElementById('fileRef');
+  if (fileRefInput) fileRefInput.addEventListener('change', function(e){
+    var f = e.target.files[0]; if (!f) return;
+    var r = new FileReader();
+    r.onload = function(){ REF = parseReferenceCSV(r.result); };
+    r.readAsText(f);
   });
+
+  var selAccount = document.getElementById('addAccount');
+  var noFileRow = document.getElementById('addNoFileRow');
+  var noFileChk = document.getElementById('addNoFile');
+  var fileRow = document.getElementById('addFileRow');
+  var fileInput = document.getElementById('addFile');
+  var balRow = document.getElementById('addBalanceRow');
+  var balLabel = document.getElementById('addBalanceLabel');
+  var balInput = document.getElementById('addBalanceInput');
+  var btnAdd = document.getElementById('btnAddFile');
+  var errBox = document.getElementById('addFileError');
+  if (!selAccount) return;
+
+  // Holds the most recent parse result while we wait on a manual balance
+  // (Ameris, or a BoA file with pending transactions) - set on the first
+  // "Add" click, consumed on the second, so the file isn't re-read.
+  var pendingParsed = null;
+
+  function showError(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function clearError(){ errBox.style.display = 'none'; errBox.textContent = ''; }
+
+  function syncVisibility(){
+    var info = accountInfo(selAccount.value);
+    pendingParsed = null; clearError();
+    if (!info){ noFileRow.style.display='none'; fileRow.style.display='none'; balRow.style.display='none'; btnAdd.disabled=true; return; }
+    noFileRow.style.display = 'block';
+    var noFile = noFileChk.checked;
+    fileRow.style.display = noFile ? 'none' : 'block';
+    if (info.type === 'ameris'){
+      balRow.style.display = 'block';
+      balLabel.textContent = 'Current balance (Ameris exports have no balance column - type it in)';
+    } else if (noFile){
+      balRow.style.display = 'block';
+      balLabel.textContent = 'Balance to carry forward';
+    } else {
+      balRow.style.display = 'none';
+    }
+    btnAdd.disabled = false;
+  }
+  selAccount.addEventListener('change', syncVisibility);
+  noFileChk.addEventListener('change', syncVisibility);
+  fileInput.addEventListener('change', function(){ pendingParsed = null; clearError(); });
+  balInput.addEventListener('input', clearError);
+
+  btnAdd.addEventListener('click', function(){
+    var info = accountInfo(selAccount.value);
+    if (!info) return;
+    clearError();
+
+    if (noFileChk.checked){
+      var carryBal = parseFloat(balInput.value);
+      if (isNaN(carryBal)){ showError('Enter the balance to carry forward.'); return; }
+      mergeAccountData(info.value, [], { account: info.value, balance: carryBal, source: 'carry-forward' });
+      return;
+    }
+
+    function finish(parsed){
+      if (info.type === 'ameris' || parsed.balanceNeedsConfirmation){
+        var typed = parseFloat(balInput.value);
+        if (isNaN(typed)){
+          pendingParsed = parsed;
+          balRow.style.display = 'block';
+          balLabel.textContent = info.type === 'ameris'
+            ? 'Current balance (Ameris exports have no balance column - type it in)'
+            : 'This account has pending transactions - BoA’s own ending balance ($' + parsed.balance.toFixed(2) + ') may not match reality. Type the confirmed current balance:';
+          showError('Enter the confirmed balance above, then click "Add this account" again.');
+          return;
+        }
+        mergeAccountData(info.value, parsed.transactions, { account: info.value, balance: typed, source: 'manual-confirmed' });
+      } else {
+        mergeAccountData(info.value, parsed.transactions, { account: info.value, balance: parsed.balance, source: 'file' });
+      }
+    }
+
+    if (pendingParsed){ finish(pendingParsed); return; }
+
+    var f = fileInput.files[0];
+    if (!f){ showError('Choose a file, or check "no new file this round".'); return; }
+    var reader = new FileReader();
+    reader.onload = function(){
+      try {
+        var parser = info.type==='boa' ? parseBoAFile : info.type==='delta' ? parseDeltaFile : parseAmerisFile;
+        finish(parser(reader.result, info.value));
+      } catch (e){
+        showError('Could not parse this file: ' + e.message);
+      }
+    };
+    reader.readAsText(f);
+  });
+
+  syncVisibility();
 }
 
 document.getElementById('btnReset').addEventListener('click', function(){
@@ -380,7 +592,7 @@ var FB = (function(){
   function _normalize(data){
     if (!data || !data.pull) return { pull: null };
     var p = data.pull;
-    return { pull: { pullDate:p.pullDate, status:p.status, transactions:_fbArr(p.transactions), balances:_fbArr(p.balances) } };
+    return { pull: { pullDate:p.pullDate, status:p.status, transactions:_fbArr(p.transactions), balances:_fbArr(p.balances), filesAdded:_fbArr(p.filesAdded) } };
   }
   function _buildPayload(){ return { kind:'budget-ingest', version:SCHEMA_VERSION, savedAt:new Date().toISOString(), pull: STATE.pull }; }
   function _applyPayload(result){ if(!result) return; STATE = _normalize(result); saveLocal(); render(); }
