@@ -1,0 +1,9 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Never commit real financial data into this public repo - see AGENTS.md
+archive_reference_full.csv
+*.xlsx
+*reference*.csv

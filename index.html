@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Budget Ingest</title>
+<style>
+:root{
+  --ink:#15201C; --paper:#F3F1EA; --muted:#8A8A82; --border:#D8D5CC;
+  --accent:#0C5A6E; --accent-ink:#FFFFFF;
+  --warn-bg:#FFF3C4; --warn-ink:#6B5200; --warn-border:#C9A52B;
+  --claude-bg:#EEEDFE; --claude-ink:#3C3489; --claude-border:#8B82E8;
+  --ok-bg:#EDF4EE; --ok-ink:#2A6030;
+  --synced-c:#2A6030; --syncing-c:#7A6000; --offline-c:#9B2020;
+}
+*{box-sizing:border-box;}
+body{margin:0; background:var(--paper); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-size:15px; line-height:1.4; padding-bottom:80px;}
+header{position:sticky; top:0; z-index:20; background:var(--paper); border-bottom:1px solid var(--border); padding:10px 14px; display:flex; align-items:center; justify-content:space-between;}
+h1{font-size:17px; margin:0;}
+.sync-badge{font-size:11px; display:flex; align-items:center; gap:5px; color:var(--muted);}
+.sync-dot{width:8px; height:8px; border-radius:50%; background:var(--muted);}
+.sync-dot[data-state="synced"]{background:var(--synced-c);}
+.sync-dot[data-state="syncing"]{background:var(--syncing-c);}
+.sync-dot[data-state="offline"]{background:var(--offline-c);}
+main{padding:14px; max-width:720px; margin:0 auto;}
+.card{background:#fff; border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px;}
+.card h2{font-size:14px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted);}
+.file-row{display:flex; flex-direction:column; gap:8px; margin-bottom:10px;}
+.file-row label{font-size:13px; color:var(--muted);}
+input[type=file]{font-size:14px;}
+button{font-family:inherit; font-size:14px; border-radius:7px; border:1px solid var(--border); background:#fff; padding:9px 14px; cursor:pointer;}
+button.primary{background:var(--accent); color:var(--accent-ink); border-color:var(--accent); font-weight:600;}
+button.primary:disabled{opacity:.45; cursor:default;}
+button.ghost{background:transparent; border-color:transparent; color:var(--accent); padding:4px 8px;}
+.txn{border:1px solid var(--border); border-radius:8px; padding:10px; margin-bottom:8px; background:#fff;}
+.txn.needs-review{border-color:var(--warn-border); background:var(--warn-bg);}
+.txn.needs-claude{border-color:var(--claude-border); background:var(--claude-bg);}
+.txn.ok{background:var(--ok-bg); border-color:#8BBD93;}
+.txn-desc{font-size:13px; font-weight:600;}
+.txn-meta{font-size:12px; color:var(--muted); margin-top:2px;}
+.txn-controls{display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;}
+select, .freetext{font-size:14px; padding:6px 8px; border-radius:6px; border:1px solid var(--border); flex:1; min-width:140px;}
+.tag{font-size:10px; font-family:'Courier New',monospace; padding:2px 6px; border-radius:4px; display:inline-block;}
+.tag.warn{background:var(--warn-border); color:#fff;}
+.tag.claude{background:var(--claude-border); color:#fff;}
+.tag.ok{background:#8BBD93; color:#fff;}
+.section-count{font-size:12px; color:var(--muted); font-weight:normal;}
+.bal-row{display:flex; justify-content:space-between; font-size:13px; padding:4px 0; border-bottom:1px solid var(--border);}
+.bal-row:last-child{border-bottom:none;}
+.empty{color:var(--muted); font-size:13px; font-style:italic;}
+.footer-bar{position:fixed; left:0; right:0; bottom:0; background:#fff; border-top:1px solid var(--border); padding:10px 14px; display:flex; gap:8px; z-index:30;}
+.footer-bar button{flex:1;}
+.pill{display:inline-block; font-size:11px; padding:3px 8px; border-radius:20px; background:var(--border); margin-right:4px;}
+.update-banner{position:fixed; left:12px; right:12px; bottom:70px; z-index:500; background:var(--warn-bg); color:var(--warn-ink); border:1px solid var(--warn-border); border-radius:10px; padding:12px 16px; font-size:14px; font-weight:600; text-align:center; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.15);}
+#staleBlock{position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; padding:20px;}
+.stale-block-card{background:#fff; border-radius:10px; padding:20px; max-width:360px; text-align:center;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Budget Ingest</h1>
+  <div class="sync-badge"><span class="sync-dot" id="syncBadge" data-state="offline"></span><span id="syncLabel">offline</span></div>
+</header>
+<main id="main"></main>
+
+<div class="footer-bar" id="footerBar" style="display:none;">
+  <button id="btnReset">Start over</button>
+  <button class="primary" id="btnReady">Mark ready for Claude</button>
+</div>
+
+<script>
+// ============================================================================
+// DATA MODEL
+// STATE.pull is the one in-progress ingestion session. There is only ever
+// one "current" pull at a time - matches how Chris actually works (export
+// one bank CSV, finish categorizing it, hand off to Claude, repeat).
+// pull.status: 'staging' (Chris is still reviewing) -> 'ready' (saved,
+// waiting for a Claude Code session to read it and build the next handoff)
+// -> cleared by "Start over" once Claude has consumed it.
+//
+// SCOPE NOTE (v1, 2026-11-16): this app does categorization, not dedup.
+// Cross-pull duplicate detection (the same transaction appearing in two
+// overlapping bank exports) stays with the existing Claude-side reconcile
+// scripts (dedupAndCategorize() in handoff_v26_build_writeplan.js and its
+// predecessors), which already do this correctly against the live T1 table.
+// This app only flags/removes exact duplicate ROWS within one upload.
+// ============================================================================
+var SCHEMA_VERSION = 1;
+var STATE = { pull: null };
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function uid(prefix){ return prefix + '-' + Math.random().toString(36).slice(2) + '-' + Date.now(); }
+
+// ---------------- CSV / date helpers (ported from the Excel reconciliation pipeline) ----------------
+function parseCSVRows(text){
+  var rows=[], row=[], field='', inQuotes=false;
+  text = text.replace(/^﻿/, '');
+  for (var i=0;i<text.length;i++){
+    var c=text[i], n=text[i+1];
+    if (inQuotes){ if(c==='"'&&n==='"'){field+='"';i++;} else if(c==='"'){inQuotes=false;} else field+=c; }
+    else { if(c==='"') inQuotes=true; else if(c===',') {row.push(field);field='';} else if(c==='\r'){} else if(c==='\n'){row.push(field);rows.push(row);row=[];field='';} else field+=c; }
+  }
+  if (field.length || row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+var EXCEL_EPOCH_MS = Date.UTC(1899,11,30);
+function toSerial(dateStr){
+  var m = String(dateStr).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!m) return null;
+  var mo=+m[1], da=+m[2], yr=m[3].length===2?('20'+m[3]):m[3];
+  return Math.round((Date.UTC(+yr, mo-1, da) - EXCEL_EPOCH_MS) / 86400000);
+}
+function isoFromSerial(serial){ return new Date(EXCEL_EPOCH_MS + serial*86400000).toISOString().slice(0,10); }
+// Known limitation (same as the rest of this pipeline): week boundaries are
+// hardcoded per calendar month. Add the new month's bounds here when this
+// app is used past November 2026.
+var WK_BOUNDS = [
+  ['Wk1', toSerial('11/1/26'), toSerial('11/8/26')],
+  ['Wk2', toSerial('11/9/26'), toSerial('11/15/26')],
+  ['Wk3', toSerial('11/16/26'), toSerial('11/22/26')],
+  ['Wk4', toSerial('11/23/26'), toSerial('11/30/26')],
+];
+function weekOf(serial){ for (var i=0;i<WK_BOUNDS.length;i++){ if(serial>=WK_BOUNDS[i][1] && serial<=WK_BOUNDS[i][2]) return WK_BOUNDS[i][0]; } return 'Wk5'; }
+
+function parseBankCSV(text){
+  var rawRows = parseCSVRows(text);
+  var balances = [];
+  var hdr = -1;
+  for (var i=0;i<rawRows.length;i++){
+    var r0 = String(rawRows[i][0]||'').trim();
+    if (r0==='Date' && String(rawRows[i][1]||'').trim()==='Description'){ hdr=i; break; }
+    var bal = parseFloat(rawRows[i][1]);
+    if (r0 && !isNaN(bal)) balances.push({account:r0, balance:bal});
+  }
+  var txns = [];
+  for (var r=hdr+1; r<rawRows.length; r++){
+    var row = rawRows[r];
+    var date=row[0], desc=row[1], amount=row[2], account=row[3];
+    if (!date || !desc) continue;
+    var amt = parseFloat(String(amount).replace(/,/g,''));
+    if (isNaN(amt) || amt===0) continue;
+    txns.push({ id: uid('t'), dateStr: date, serial: toSerial(date), description: desc, amount: Math.abs(amt), isDebit: amt<0, account: account });
+  }
+  return { balances: balances, transactions: txns };
+}
+
+// ---------------- categorization (ported from normalize_lib.js + dedupAndCategorize()) ----------------
+var AMBIGUOUS_STOREFRONTS = ['WM SUPERCENTER','WAL-MART','WALMART','SAMS CLUB',"SAM'S CLUB",'TARGET','COSTCO'];
+var DISAMBIGUATING_KEYWORDS = ['FUEL','GAS','PHARMACY','NEIGHBORHOOD MARKET','LIQUOR'];
+function normalizeDesc(desc){
+  if (!desc) return { key:'', ambiguous:false };
+  var original = String(desc).toUpperCase();
+  var s = original;
+  var indnName = '';
+  var indnMatch = s.match(/INDN:\s*([A-Z]+(?:\s+[A-Z]+)?)/);
+  if (indnMatch) indnName = indnMatch[1].trim();
+  s = s.replace(/\d{1,2}\/\d{1,2}(\/\d{2,4})?/g, ' ');
+  s = s.replace(/#?\d{4,}/g, ' ');
+  try {
+    s = s.replace(/(?<!CO )\bID:\s*[A-Z0-9-]*\d[A-Z0-9-]*\b/g, ' ');
+    s = s.replace(/(?<=PMTS )ID:\s*[A-Z0-9-]+\b/g, ' ');
+  } catch(e) { /* lookbehind unsupported - degrades gracefully, more rows land in needs-review */ }
+  s = s.replace(/\b(PURCHASE|WITHDRWL|DES|ID|CO|WEB|INDN|XXXXX\w*)\b/g, ' ');
+  s = s.replace(/[^A-Z0-9 *.'-]/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  var key = s.split(' ').slice(0,4).join(' ');
+  var isAmbiguousStorefront = AMBIGUOUS_STOREFRONTS.some(function(name){ return key.indexOf(name)!==-1 || original.indexOf(name)!==-1; });
+  var foundKeyword = DISAMBIGUATING_KEYWORDS.find(function(kw){ return original.indexOf(kw)!==-1; });
+  if (indnName) key = key + ' INDN:' + indnName;
+  if (foundKeyword) key = key + ' [' + foundKeyword + ']';
+  return { key:key, ambiguous: isAmbiguousStorefront && !foundKeyword };
+}
+function categorize(desc, serial, refByKey){
+  var wk = weekOf(serial), wkNum = wk.replace('Wk','');
+  if (/\b(AMAZON|AMZN)\b/i.test(desc)) return { sub:'random_amazon', main:'RANDOM', logistics:'OTHER', priority:'02_PRIORITY', schedule:'02_PRIORITY', confidence:'high' };
+  if (/\bKROGER\b/i.test(desc) && /\bFUEL\b/i.test(desc)) return { sub:'auto_gas_wk'+wkNum, main:'AUTO', logistics:'LIVING EXPENSES', priority:'01_PRIORITY_WEEKLY', schedule:'03_WKLY', confidence:'high' };
+  if (/\bKROGER\b/i.test(desc) || /MCDONALD'?S\b/i.test(desc) || /CHICK.?FIL.?A/i.test(desc) || /\bWAL.?MART\b/i.test(desc) || /\bWM SUPERCENTER\b/i.test(desc)) return { sub:'food_groceries_wk'+wkNum, main:'FOOD', logistics:'LIVING EXPENSES', priority:'01_PRIORITY_WEEKLY', schedule:'03_WKLY', confidence:'high' };
+  var key = normalizeDesc(desc).key;
+  var match = refByKey.get(key);
+  if (match && match.category_main === '??') return { sub:'low-confidence', main:'XXCON', logistics:'', priority:'', schedule:'', confidence:'needs-review' };
+  if (match) {
+    var sub = match.category_sub;
+    if (match.priority === '01_PRIORITY_WEEKLY' && /_wk\d+$/i.test(sub)) sub = sub.replace(/_wk\d+$/i,'') + '_wk' + wkNum;
+    return { sub:sub, main:match.category_main, logistics:match.category_logistics, priority:match.priority, schedule:match.schedule, confidence: match.confidence || 'high' };
+  }
+  return { sub:'low-confidence', main:'XXCON', logistics:'', priority:'', schedule:'', confidence:'needs-review' };
+}
+function parseReferenceCSV(text){
+  var rows = parseCSVRows(text);
+  var headers = rows[0];
+  var refByKey = new Map(), subSet = new Set();
+  for (var i=1;i<rows.length;i++){
+    var r = rows[i]; if (!r[0] && r.length<2) continue;
+    var o = {}; for (var j=0;j<headers.length;j++) o[headers[j]] = r[j]!==undefined?r[j]:'';
+    refByKey.set(o.key, o);
+    if (o.category_sub) subSet.add(o.category_sub.replace(/_wk\d+$/i,''));
+  }
+  return { refByKey: refByKey, subs: Array.from(subSet).sort() };
+}
+
+// ---------------- app state / render ----------------
+var REF = { refByKey: new Map(), subs: [] };
+
+function newPull(bankParsed){
+  var txns = bankParsed.transactions.map(function(t){
+    var cat = categorize(t.description, t.serial, REF.refByKey);
+    return Object.assign({}, t, cat, { resolved: cat.confidence === 'high', flaggedForClaude:false, claudeNote:'' });
+  });
+  STATE.pull = { pullDate: new Date().toISOString().slice(0,10), status:'staging', transactions: txns, balances: bankParsed.balances };
+  saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+}
+
+function render(){
+  var main = document.getElementById('main');
+  var footer = document.getElementById('footerBar');
+  if (!STATE.pull){
+    main.innerHTML =
+      '<div class="card"><h2>Start a new pull</h2>' +
+      '<div class="file-row"><label>Bank export CSV (required)</label><input type="file" id="fileBank" accept=".csv"></div>' +
+      '<div class="file-row"><label>Reference file - archive_reference_full.csv (optional - skip and everything lands in "needs your review")</label><input type="file" id="fileRef" accept=".csv"></div>' +
+      '<button class="primary" id="btnStart" disabled>Parse &amp; categorize</button>' +
+      '</div>';
+    wireUpload();
+    footer.style.display = 'none';
+    return;
+  }
+  var p = STATE.pull;
+  var needsReview = p.transactions.filter(function(t){ return !t.resolved && !t.flaggedForClaude; });
+  var needsClaude = p.transactions.filter(function(t){ return t.flaggedForClaude; });
+  var ok = p.transactions.filter(function(t){ return t.resolved && !t.flaggedForClaude; });
+  var html = '';
+  html += '<div class="card"><h2>Account balances as of ' + esc(p.pullDate) + '</h2>';
+  html += p.balances.length ? p.balances.map(function(b){ return '<div class="bal-row"><span>'+esc(b.account)+'</span><span>$'+b.balance.toFixed(2)+'</span></div>'; }).join('') : '<div class="empty">No balance header found in this CSV.</div>';
+  html += '</div>';
+
+  html += '<div class="card"><h2>Needs your review <span class="section-count">(' + needsReview.length + ')</span></h2>';
+  html += needsReview.length ? needsReview.map(renderReviewTxn).join('') : '<div class="empty">Nothing left to review.</div>';
+  html += '</div>';
+
+  html += '<div class="card"><h2>Flagged for Claude <span class="section-count">(' + needsClaude.length + ')</span></h2>';
+  html += needsClaude.length ? needsClaude.map(renderClaudeTxn).join('') : '<div class="empty">Nothing flagged.</div>';
+  html += '</div>';
+
+  html += '<div class="card"><h2>Auto-categorized <span class="section-count">(' + ok.length + ')</span></h2>';
+  html += ok.length ? ok.map(renderOkTxn).join('') : '<div class="empty">None yet.</div>';
+  html += '</div>';
+
+  main.innerHTML = html;
+  footer.style.display = 'flex';
+  document.getElementById('btnReady').disabled = (needsReview.length > 0);
+  wireReview();
+}
+function money(t){ return (t.isDebit?'-':'+') + '$' + t.amount.toFixed(2); }
+function renderReviewTxn(t){
+  var opts = REF.subs.map(function(s){ return '<option value="'+esc(s)+'"'+(t.sub===s?' selected':'')+'>'+esc(s)+'</option>'; }).join('');
+  return '<div class="txn needs-review" data-id="'+t.id+'">' +
+    '<div class="txn-desc">'+esc(t.description)+'</div>' +
+    '<div class="txn-meta">'+esc(t.dateStr)+' &middot; '+money(t)+' &middot; '+esc(t.account)+'</div>' +
+    '<div class="txn-controls">' +
+      '<select class="cat-select" data-id="'+t.id+'"><option value="">- pick a category -</option>'+opts+'</select>' +
+      '<input class="freetext new-sub" data-id="'+t.id+'" placeholder="or type a new sub name">' +
+    '</div>' +
+    '<div class="txn-controls"><button class="ghost flag-claude" data-id="'+t.id+'">Flag for Claude instead</button></div>' +
+  '</div>';
+}
+function renderClaudeTxn(t){
+  return '<div class="txn needs-claude" data-id="'+t.id+'">' +
+    '<div class="txn-desc">'+esc(t.description)+' <span class="tag claude">needs claude</span></div>' +
+    '<div class="txn-meta">'+esc(t.dateStr)+' &middot; '+money(t)+' &middot; '+esc(t.account)+'</div>' +
+    '<div class="txn-controls"><button class="ghost unflag-claude" data-id="'+t.id+'">Undo flag</button></div>' +
+  '</div>';
+}
+function renderOkTxn(t){
+  return '<div class="txn ok" data-id="'+t.id+'">' +
+    '<div class="txn-desc">'+esc(t.description)+' <span class="tag ok">'+esc(t.sub)+'</span></div>' +
+    '<div class="txn-meta">'+esc(t.dateStr)+' &middot; '+money(t)+' &middot; '+esc(t.account)+'</div>' +
+  '</div>';
+}
+function findTxn(id){ return STATE.pull.transactions.find(function(t){ return t.id===id; }); }
+function wireReview(){
+  document.querySelectorAll('.cat-select').forEach(function(sel){
+    sel.addEventListener('change', function(){
+      var t = findTxn(sel.dataset.id); if (!t || !sel.value) return;
+      t.sub = sel.value; t.resolved = true;
+      saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+    });
+  });
+  document.querySelectorAll('.new-sub').forEach(function(inp){
+    inp.addEventListener('change', function(){
+      var t = findTxn(inp.dataset.id); if (!t || !inp.value.trim()) return;
+      t.sub = inp.value.trim();
+      // A brand-new sub name usually means a new catalog row is needed too -
+      // that's a decision for Claude/Chris together, not something this app
+      // can safely finish on its own.
+      t.flaggedForClaude = true;
+      t.claudeNote = 'New sub proposed: ' + t.sub + ' - needs a catalog entry';
+      saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+    });
+  });
+  document.querySelectorAll('.flag-claude').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var t = findTxn(btn.dataset.id); if (!t) return;
+      t.flaggedForClaude = true; t.claudeNote = t.claudeNote || 'Chris flagged this for review';
+      saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+    });
+  });
+  document.querySelectorAll('.unflag-claude').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var t = findTxn(btn.dataset.id); if (!t) return;
+      t.flaggedForClaude = false; t.claudeNote = '';
+      saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+    });
+  });
+}
+function wireUpload(){
+  var bankFile=null, refFile=null;
+  document.getElementById('fileBank').addEventListener('change', function(e){ bankFile = e.target.files[0]; check(); });
+  document.getElementById('fileRef').addEventListener('change', function(e){ refFile = e.target.files[0]; check(); });
+  function check(){ document.getElementById('btnStart').disabled = !bankFile; }
+  document.getElementById('btnStart').addEventListener('click', function(){
+    var readBank = new Promise(function(res){ var r=new FileReader(); r.onload=function(){res(r.result);}; r.readAsText(bankFile); });
+    var readRef = refFile ? new Promise(function(res){ var r=new FileReader(); r.onload=function(){res(r.result);}; r.readAsText(refFile); }) : Promise.resolve(null);
+    Promise.all([readBank, readRef]).then(function(results){
+      if (results[1]) REF = parseReferenceCSV(results[1]);
+      newPull(parseBankCSV(results[0]));
+    });
+  });
+}
+
+document.getElementById('btnReset').addEventListener('click', function(){
+  if (!confirm('Start over? This clears the current pull (locally and in Firebase) once Claude has already used it - only do this after the handoff is built.')) return;
+  STATE.pull = null; saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+});
+document.getElementById('btnReady').addEventListener('click', function(){
+  if (!STATE.pull) return;
+  STATE.pull.status = 'ready';
+  saveLocal(); render(); if (typeof FB!=='undefined') FB.scheduleWrite();
+  alert('Marked ready. Tell a Claude Code session to build the next handoff - it will read this pull from Firebase.');
+});
+
+// ---------------- local persistence ----------------
+function saveLocal(){ try { localStorage.setItem('budget-ingest-v1', JSON.stringify(STATE)); } catch(e){} }
+function loadLocal(){ try { var raw = localStorage.getItem('budget-ingest-v1'); if (raw) STATE = JSON.parse(raw); } catch(e){} }
+
+// ============================================================================
+// FIREBASE SYNC MODULE - structural copy of the pattern used by every other
+// app in this family (ignite-trip-app, missionbudget01). Reuses the
+// existing mcdonald-budget-01 project under a new budget/ingest path -
+// no new Firebase project, no new rules deploy (budget/ is already open).
+// Rules carried forward, do not strip when touching this: the _fbArr()
+// array normalizer, the savedAt echo guard, the 300ms write debounce, and
+// the SCHEMA_VERSION stale-block guard.
+// ============================================================================
+var _staleBlocked = false;
+function hardReload(){ location.href = location.pathname + '?v=' + Date.now(); }
+function showStaleBlock(){
+  if (_staleBlocked) return; _staleBlocked = true;
+  var o = document.createElement('div'); o.id='staleBlock';
+  o.innerHTML = '<div class="stale-block-card">This app is out of date - someone else has already saved a newer version. Reload to keep working safely (nothing already saved will be lost).<br><button onclick="hardReload()">Reload</button></div>';
+  document.body.appendChild(o);
+}
+var FB = (function(){
+  var _config = {
+    apiKey:            "AIzaSyBT_eGObW-c9tBTpLqPovvSoN-Ieo-jGe8",
+    authDomain:        "mcdonald-budget-01.firebaseapp.com",
+    projectId:         "mcdonald-budget-01",
+    storageBucket:     "mcdonald-budget-01.firebasestorage.app",
+    messagingSenderId: "472291576800",
+    appId:             "1:472291576800:web:722f5e004b5e2ef5b83985",
+    databaseURL:       "https://mcdonald-budget-01-default-rtdb.firebaseio.com"
+  };
+  var _db=null, _ref=null, _writeTimer=null, _lastSavedAt=null, _initialized=false, _listenerOn=false;
+  function _setStatus(state,label){ var b=document.getElementById('syncBadge'), l=document.getElementById('syncLabel'); if(b) b.setAttribute('data-state',state); if(l) l.textContent=label||state; }
+  function _fbArr(val){
+    if(!val) return [];
+    if(Array.isArray(val)) return val;
+    if(typeof val==='object'){ var keys=Object.keys(val); if(keys.length>0 && keys.every(function(k){return /^\d+$/.test(k);})) return keys.sort(function(a,b){return +a-+b;}).map(function(k){return val[k];}); }
+    return [];
+  }
+  function _normalize(data){
+    if (!data || !data.pull) return { pull: null };
+    var p = data.pull;
+    return { pull: { pullDate:p.pullDate, status:p.status, transactions:_fbArr(p.transactions), balances:_fbArr(p.balances) } };
+  }
+  function _buildPayload(){ return { kind:'budget-ingest', version:SCHEMA_VERSION, savedAt:new Date().toISOString(), pull: STATE.pull }; }
+  function _applyPayload(result){ if(!result) return; STATE = _normalize(result); saveLocal(); render(); }
+  function _doWrite(){
+    if(!_ref || _staleBlocked) return;
+    _setStatus('syncing','syncing...');
+    var payload = _buildPayload(); _lastSavedAt = payload.savedAt;
+    _ref.set(payload).then(function(){ _setStatus('synced','synced'); }).catch(function(){ _setStatus('offline','offline'); });
+  }
+  function scheduleWrite(){ if(!_initialized) return; clearTimeout(_writeTimer); _writeTimer=setTimeout(_doWrite,300); }
+  function init(){
+    try{
+      if (typeof firebase==='undefined' || !firebase.app){ _setStatus('offline','offline'); return; }
+      var app = firebase.apps.length ? firebase.app() : firebase.initializeApp(_config);
+      _db = firebase.database(app);
+      _ref = _db.ref('budget/ingest/current');
+      _initialized = true; _setStatus('syncing','loading...');
+      _ref.once('value').then(function(snap){
+        var data = snap.val();
+        if (data && data.savedAt){
+          _lastSavedAt = data.savedAt;
+          if (typeof data.version==='number' && data.version>SCHEMA_VERSION){ showStaleBlock(); _setStatus('offline','out of date'); }
+          else { _applyPayload(data); _setStatus('synced','synced'); }
+        } else if (STATE.pull) { _doWrite(); }
+        else { _setStatus('synced','synced'); }
+        if (!_listenerOn){
+          _listenerOn = true;
+          _ref.on('value', function(snap2){
+            var remote = snap2.val();
+            if (!remote || !remote.savedAt) return;
+            if (_lastSavedAt && remote.savedAt <= _lastSavedAt) return;
+            _lastSavedAt = remote.savedAt;
+            if (typeof remote.version==='number' && remote.version>SCHEMA_VERSION){ showStaleBlock(); _setStatus('offline','out of date'); return; }
+            _setStatus('syncing','syncing...'); _applyPayload(remote); _setStatus('synced','synced');
+          });
+        }
+      }).catch(function(){ _setStatus('offline','offline'); });
+    } catch(e){ _setStatus('offline','offline'); }
+  }
+  if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', init); else setTimeout(init,100);
+  return { scheduleWrite: scheduleWrite };
+})();
+
+// ---------------- update-check banner (same pattern as the dashboard/ignite apps) ----------------
+(function(){
+  var CHECK_INTERVAL_MS = 5*60*1000; var _knownTag = null;
+  function check(){
+    fetch(location.pathname, {method:'HEAD', cache:'no-store'}).then(function(r){
+      var tag = r.headers.get('etag') || r.headers.get('last-modified');
+      if (!tag) return;
+      if (_knownTag && tag!==_knownTag) showBanner();
+      _knownTag = tag;
+    }).catch(function(){});
+  }
+  function showBanner(){
+    if (document.getElementById('updateBanner')) return;
+    var b = document.createElement('div'); b.id='updateBanner'; b.className='update-banner';
+    b.textContent = 'A new version is available — tap to reload'; b.onclick = hardReload;
+    document.body.appendChild(b);
+  }
+  check(); setInterval(check, CHECK_INTERVAL_MS);
+  document.addEventListener('visibilitychange', function(){ if (document.visibilityState==='visible') check(); });
+  window.addEventListener('pageshow', check);
+})();
+
+loadLocal();
+render();
+</script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+</body>
+</html>
