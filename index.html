@@ -234,6 +234,53 @@ var ACCOUNTS = [
 ];
 function accountInfo(value){ return ACCOUNTS.find(function(a){ return a.value===value; }); }
 
+// ---------------- auto-detection (added 2026-11-16, Chris: "having to make
+// note of which account slows down the process") ----------------
+// sniffFileType: content-based, reliable for all three institutions - each
+// has a distinct, exact header row this pipeline already searches for.
+// Delta's own "Account Name : <value>" header line has no comma before the
+// colon, so it lands whole in field 0 (e.g. "Account Name : Savings", or
+// "Account Name : Free Checking ****959" with trailing empty fields after
+// it on some pulls) - never split into separate label/value columns.
+function deltaAccountNameLine(rows){
+  for (var i=0;i<Math.min(rows.length,5);i++){
+    var f0 = String(rows[i][0]||'').trim();
+    if (/^account name\s*:/i.test(f0)) return f0;
+  }
+  return null;
+}
+function sniffFileType(text){
+  var rows = parseCSVRows(text);
+  if (deltaAccountNameLine(rows)) return 'delta';
+  for (var r=0;r<rows.length;r++){
+    if (rows[r][0]==='Date' && rows[r][1]==='Description') return 'boa';
+    if (rows[r][0]==='Date' && rows[r][2]==='Transaction Type') return 'ameris';
+    if (String(rows[r][0]||'').trim().toUpperCase()==='BALANCE') return 'ameris'; // the prepended-balance convention
+  }
+  return null;
+}
+// resolveDeltaAccount: every Delta export states its own account name in
+// the header ("Account Name : Savings" / "... Money Market ****514" /
+// "... Free Checking ****959") - no ambiguity, no need to ask.
+function resolveDeltaAccount(text){
+  var line = deltaAccountNameLine(parseCSVRows(text));
+  if (!line) return null;
+  var nameLine = line.toLowerCase();
+  if (nameLine.indexOf('savings')!==-1) return 'delta savings';
+  if (nameLine.indexOf('money market')!==-1) return 'delta money market';
+  if (nameLine.indexOf('checking')!==-1) return 'delta pay from';
+  return null;
+}
+// resolveAmerisAccount: Ameris's own export filename embeds the account's
+// last 4 digits ("Transactions_5385_...csv" = MACS TAX ****5385). Extend
+// AMERIS_LAST4 if a new Ameris account starts producing files.
+var AMERIS_LAST4 = { '5385':'ameris macs tax', '4036':'ameris macs rox' };
+function resolveAmerisAccount(filename){
+  var m = String(filename||'').match(/Transactions_(\d+)_/i);
+  if (!m) return null;
+  return AMERIS_LAST4[m[1]] || null;
+}
+
 // ---------------- categorization (ported from normalize_lib.js + dedupAndCategorize()) ----------------
 var AMBIGUOUS_STOREFRONTS = ['WM SUPERCENTER','WAL-MART','WALMART','SAMS CLUB',"SAM'S CLUB",'TARGET','COSTCO'];
 var DISAMBIGUATING_KEYWORDS = ['FUEL','GAS','PHARMACY','NEIGHBORHOOD MARKET','LIQUOR'];
@@ -361,12 +408,26 @@ function renderAddFileCard(){
   var acctOpts = ACCOUNTS.map(function(a){ return '<option value="'+a.value+'">'+esc(a.label)+'</option>'; }).join('');
   var html = '<div class="card"><h2>Add a bank file</h2>';
   html += '<div class="file-row"><label>Reference file - archive_reference_full.csv (optional, upload once - skip and everything lands in "needs your review")</label><input type="file" id="fileRef" accept=".csv"></div>';
-  html += '<div class="file-row"><label>Account</label><select id="addAccount"><option value="">- choose account -</option>' + acctOpts + '</select></div>';
-  html += '<div class="file-row" id="addNoFileRow" style="display:none;"><label><input type="checkbox" id="addNoFile"> No new file this round for this account - just set/confirm its balance</label></div>';
-  html += '<div class="file-row" id="addFileRow" style="display:none;"><label id="addFileLabel">Raw export file (.csv)</label><input type="file" id="addFile" accept=".csv,.CSV"></div>';
+
+  // Account is auto-detected from the file itself (added 2026-11-16, Chris:
+  // "having to make note of which account slows down the process") - Delta
+  // and Ameris are fully automatic, BoA only needs one Joint/Hamly tap since
+  // its own exports carry no account-identifying text at all.
+  html += '<div class="file-row"><label>Raw export file (.csv) - any BoA, Delta or Ameris export, no need to say which account</label><input type="file" id="addFile" accept=".csv,.CSV"></div>';
+  html += '<div id="detectStatus" style="display:none; font-size:13px; color:var(--muted); margin-bottom:8px;"></div>';
+  html += '<div class="file-row" id="boaChoiceRow" style="display:none;"><label>Which BoA account is this?</label><div class="txn-controls"><button type="button" id="boaJointBtn">Joint</button><button type="button" id="boaHamlyBtn">Hamly</button></div></div>';
+  html += '<div id="manualOverrideToggleWrap" style="display:none;"><button type="button" class="ghost" id="manualOverrideToggle">Not right? Choose account manually</button></div>';
+  html += '<div class="file-row" id="manualOverrideRow" style="display:none;"><label>Account</label><select id="addAccount"><option value="">- choose account -</option>' + acctOpts + '</select></div>';
   html += '<div class="file-row" id="addBalanceRow" style="display:none;"><label id="addBalanceLabel">Current balance</label><input type="number" step="0.01" class="freetext" id="addBalanceInput" placeholder="e.g. 156.36"></div>';
   html += '<div id="addFileError" style="display:none; color:#9B2020; font-size:13px; margin-bottom:8px;"></div>';
   html += '<button class="primary" id="btnAddFile" disabled>Add this account</button>';
+
+  html += '<div style="margin:16px 0; border-top:1px solid var(--border);"></div>';
+  html += '<div class="file-row"><label><input type="checkbox" id="addNoFile"> No new file this round for an account - just set/confirm its balance</label></div>';
+  html += '<div class="file-row" id="noFileAccountRow" style="display:none;"><label>Account</label><select id="noFileAccount"><option value="">- choose account -</option>' + acctOpts + '</select></div>';
+  html += '<div class="file-row" id="noFileBalanceRow" style="display:none;"><label>Balance to carry forward</label><input type="number" step="0.01" class="freetext" id="noFileBalanceInput" placeholder="e.g. 1.00"></div>';
+  html += '<button id="btnNoFileAdd" style="display:none;">Set balance</button>';
+
   if (added.length){
     html += '<div style="margin-top:12px;">' + added.map(function(f){
       var info = accountInfo(f.account);
@@ -447,60 +508,87 @@ function wireAddFile(){
     r.readAsText(f);
   });
 
-  var selAccount = document.getElementById('addAccount');
-  var noFileRow = document.getElementById('addNoFileRow');
-  var noFileChk = document.getElementById('addNoFile');
-  var fileRow = document.getElementById('addFileRow');
   var fileInput = document.getElementById('addFile');
+  if (!fileInput) return; // add-file card not on screen
+
+  var detectStatus = document.getElementById('detectStatus');
+  var boaChoiceRow = document.getElementById('boaChoiceRow');
+  var boaJointBtn = document.getElementById('boaJointBtn');
+  var boaHamlyBtn = document.getElementById('boaHamlyBtn');
+  var manualOverrideRow = document.getElementById('manualOverrideRow');
+  var manualOverrideToggleWrap = document.getElementById('manualOverrideToggleWrap');
+  var manualOverrideToggle = document.getElementById('manualOverrideToggle');
+  var selAccount = document.getElementById('addAccount');
   var balRow = document.getElementById('addBalanceRow');
   var balLabel = document.getElementById('addBalanceLabel');
   var balInput = document.getElementById('addBalanceInput');
   var btnAdd = document.getElementById('btnAddFile');
   var errBox = document.getElementById('addFileError');
-  if (!selAccount) return;
 
-  // Holds the most recent parse result while we wait on a manual balance
-  // (Ameris, or a BoA file with pending transactions) - set on the first
-  // "Add" click, consumed on the second, so the file isn't re-read.
-  var pendingParsed = null;
+  var currentText = null;     // the selected file's text, read once
+  var resolvedAccount = null; // the account we'll actually use on Add
+  var pendingParsed = null;   // set when a manual balance confirmation is still needed
 
   function showError(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
   function clearError(){ errBox.style.display = 'none'; errBox.textContent = ''; }
-
-  function syncVisibility(){
-    var info = accountInfo(selAccount.value);
-    pendingParsed = null; clearError();
-    if (!info){ noFileRow.style.display='none'; fileRow.style.display='none'; balRow.style.display='none'; btnAdd.disabled=true; return; }
-    noFileRow.style.display = 'block';
-    var noFile = noFileChk.checked;
-    fileRow.style.display = noFile ? 'none' : 'block';
-    if (info.type === 'ameris'){
-      balRow.style.display = 'block';
-      balLabel.textContent = 'Current balance (Ameris exports have no balance column - type it in)';
-    } else if (noFile){
-      balRow.style.display = 'block';
-      balLabel.textContent = 'Balance to carry forward';
-    } else {
-      balRow.style.display = 'none';
-    }
-    btnAdd.disabled = false;
+  function showDetect(msg){ detectStatus.textContent = msg; detectStatus.style.display = 'block'; }
+  function setResolved(account){
+    resolvedAccount = account;
+    selAccount.value = account || '';
+    btnAdd.disabled = !account;
   }
-  selAccount.addEventListener('change', syncVisibility);
-  noFileChk.addEventListener('change', syncVisibility);
-  fileInput.addEventListener('change', function(){ pendingParsed = null; clearError(); });
+  function resetDetection(){
+    pendingParsed = null; clearError();
+    detectStatus.style.display = 'none';
+    boaChoiceRow.style.display = 'none';
+    manualOverrideRow.style.display = 'none';
+    manualOverrideToggleWrap.style.display = 'none';
+    balRow.style.display = 'none';
+    setResolved(null);
+  }
+
+  fileInput.addEventListener('change', function(){
+    resetDetection();
+    var f = fileInput.files[0];
+    if (!f) return;
+    var filename = f.name;
+    var reader = new FileReader();
+    reader.onload = function(){
+      currentText = reader.result;
+      var type = sniffFileType(currentText);
+      if (!type){
+        showDetect('Could not tell which bank this is from the file - choose the account below.');
+        manualOverrideRow.style.display = 'block';
+        return;
+      }
+      if (type === 'delta'){
+        var deltaAcct = resolveDeltaAccount(currentText);
+        if (deltaAcct){ showDetect('Detected: ' + accountInfo(deltaAcct).label); manualOverrideToggleWrap.style.display = 'block'; setResolved(deltaAcct); }
+        else { showDetect('Detected a Delta file, but not which account - choose it below.'); manualOverrideRow.style.display = 'block'; }
+      } else if (type === 'ameris'){
+        var amerisAcct = resolveAmerisAccount(filename);
+        if (amerisAcct){ showDetect('Detected: ' + accountInfo(amerisAcct).label); manualOverrideToggleWrap.style.display = 'block'; setResolved(amerisAcct); }
+        else { showDetect('Detected an Ameris file, but not which account from the filename - choose it below.'); manualOverrideRow.style.display = 'block'; }
+      } else { // boa - no identifying signal in the file at all, has to ask
+        showDetect('Detected a BoA file - which account?');
+        boaChoiceRow.style.display = 'block';
+      }
+    };
+    reader.readAsText(f);
+  });
+
+  boaJointBtn.addEventListener('click', function(){ setResolved('boa joint'); manualOverrideToggleWrap.style.display = 'block'; });
+  boaHamlyBtn.addEventListener('click', function(){ setResolved('boa hamly'); manualOverrideToggleWrap.style.display = 'block'; });
+  manualOverrideToggle.addEventListener('click', function(){
+    manualOverrideRow.style.display = (manualOverrideRow.style.display === 'block') ? 'none' : 'block';
+  });
+  selAccount.addEventListener('change', function(){ if (selAccount.value) setResolved(selAccount.value); });
   balInput.addEventListener('input', clearError);
 
   btnAdd.addEventListener('click', function(){
-    var info = accountInfo(selAccount.value);
-    if (!info) return;
+    var info = accountInfo(resolvedAccount);
+    if (!info || !currentText) return;
     clearError();
-
-    if (noFileChk.checked){
-      var carryBal = parseFloat(balInput.value);
-      if (isNaN(carryBal)){ showError('Enter the balance to carry forward.'); return; }
-      mergeAccountData(info.value, [], { account: info.value, balance: carryBal, source: 'carry-forward' });
-      return;
-    }
 
     function finish(parsed){
       if (info.type === 'ameris' || parsed.balanceNeedsConfirmation){
@@ -522,21 +610,33 @@ function wireAddFile(){
 
     if (pendingParsed){ finish(pendingParsed); return; }
 
-    var f = fileInput.files[0];
-    if (!f){ showError('Choose a file, or check "no new file this round".'); return; }
-    var reader = new FileReader();
-    reader.onload = function(){
-      try {
-        var parser = info.type==='boa' ? parseBoAFile : info.type==='delta' ? parseDeltaFile : parseAmerisFile;
-        finish(parser(reader.result, info.value));
-      } catch (e){
-        showError('Could not parse this file: ' + e.message);
-      }
-    };
-    reader.readAsText(f);
+    try {
+      var parser = info.type === 'boa' ? parseBoAFile : info.type === 'delta' ? parseDeltaFile : parseAmerisFile;
+      finish(parser(currentText, info.value));
+    } catch (e){
+      showError('Could not parse this file: ' + e.message);
+    }
   });
 
-  syncVisibility();
+  // --- "no new file this round" path - inherently manual, there's no file to sniff ---
+  var noFileChk = document.getElementById('addNoFile');
+  var noFileAccountRow = document.getElementById('noFileAccountRow');
+  var noFileAccountSel = document.getElementById('noFileAccount');
+  var noFileBalanceRow = document.getElementById('noFileBalanceRow');
+  var noFileBalanceInput = document.getElementById('noFileBalanceInput');
+  var btnNoFileAdd = document.getElementById('btnNoFileAdd');
+  noFileChk.addEventListener('change', function(){
+    var show = noFileChk.checked ? 'block' : 'none';
+    noFileAccountRow.style.display = show; noFileBalanceRow.style.display = show; btnNoFileAdd.style.display = show;
+  });
+  btnNoFileAdd.addEventListener('click', function(){
+    clearError();
+    var acct = noFileAccountSel.value;
+    var bal = parseFloat(noFileBalanceInput.value);
+    if (!acct){ showError('Choose which account this balance is for.'); return; }
+    if (isNaN(bal)){ showError('Enter the balance to carry forward.'); return; }
+    mergeAccountData(acct, [], { account: acct, balance: bal, source: 'carry-forward' });
+  });
 }
 
 document.getElementById('btnReset').addEventListener('click', function(){

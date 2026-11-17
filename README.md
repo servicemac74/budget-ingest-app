@@ -45,6 +45,19 @@ is the app only.
   `AUTOMATION_ROADMAP.md`). BoA excludes pending/not-yet-posted rows;
   Ameris has no balance column at all, so its balance always comes from
   a manual field instead of the file.
+- **Auto-detects which account a file belongs to** (added 2026-11-16,
+  Chris: "having to make note of which account slows down the process").
+  `sniffFileType()` tells BoA/Delta/Ameris apart from the file's own
+  header shape; `resolveDeltaAccount()` reads Delta's own "Account Name :"
+  line (fully automatic - Delta always says which account it is);
+  `resolveAmerisAccount()` reads the last 4 digits Ameris's own filename
+  always embeds (`AMERIS_LAST4` lookup, extend it if a new Ameris account
+  starts producing files). **BoA is the one exception** - its exports
+  carry no account-identifying text or filename pattern at all (checked
+  both real files directly), so the app can tell it's a BoA file but not
+  which one; it asks a single Joint-or-Hamly question only in that case.
+  A "Not right? Choose account manually" link is always available as a
+  fallback if detection gets it wrong or can't tell at all.
 - Flags when a parsed balance isn't safe to trust automatically - a BoA
   file with pending transactions, or any Ameris file - and asks Chris to
   type the confirmed balance instead of silently applying what the file
@@ -136,14 +149,21 @@ full roadmap this fits into.
   this app is used past November.
 - **No icons/manifest yet** - "Add to Home Screen" works but without a
   custom icon. Low priority, not blocking.
-- **The in-app multi-file flow has not yet been exercised against Chris's
-  real raw files through an actual browser** - the parsers themselves are
-  a direct, line-for-line port of `parse_raw_bank_exports.js` (already
-  validated there against all six real files), but this port's own UI
-  flow (per-account add, the two-step manual-balance confirmation) was
-  only checked by reading the code, not by driving a browser - flagged
-  here rather than overclaimed. See **Published, live** below for what
-  actually has been verified end-to-end.
+- **The per-account add flow (file select -> parse -> two-step balance
+  confirmation -> merge) was verified live in a browser** against all six
+  of Chris's real files, driving the actual click handlers, the day it
+  was built (2026-11-16).
+- **The auto-detection added the same day (`sniffFileType()` /
+  `resolveDeltaAccount()` / `resolveAmerisAccount()`) was verified against
+  all six real files too, but only at the function level in Node** - every
+  id the UI wiring references was cross-checked against the rendered HTML
+  by hand, but the live click-through (file picked -> detection banner ->
+  BoA Joint/Hamly buttons -> Add enabled) was not re-verified in an actual
+  browser this round. A sandboxed permission check blocked starting a
+  local test server twice in a row (once via a raw background process,
+  once via the sanctioned `preview_start`/`launch.json` path) for reasons
+  that weren't about the code itself - flagged here rather than
+  overclaimed; worth a real click-through next time a server can run.
 
 ## Where things live
 
